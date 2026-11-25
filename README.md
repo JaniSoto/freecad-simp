@@ -41,7 +41,7 @@ A bisection search over the Lagrange multiplier $\lambda$ enforces the target ph
 
 $$B_e = \frac{-(\mathbf{H}^T \nabla_{\tilde{\boldsymbol{\rho}}} C)_e}{\lambda (\mathbf{H}^T \mathbf{V})_e}$$
 
-$$\rho_e^{(k+1)} = \operatorname{clip}\Big( \operatorname{clip}\big( \rho_e^{(k)} B_e^\eta, \; \rho_e^{(k)} - m, \; \rho_e^{(k)} + m \big), \; \rho_{\min}, \; 1.0 \Big)$$
+$$\rho_e^{(k+1)} = \mathrm{clip}\Big( \mathrm{clip}\big( \rho_e^{(k)} B_e^\eta, \; \rho_e^{(k)} - m, \; \rho_e^{(k)} + m \big), \; \rho_{\min}, \; 1.0 \Big)$$
 
 Where $\eta = 0.5$, and $m$ is the move limit with progressive decay ($m_{k+1} = \max(0.04, m_k \times 0.96)$ after iteration 15). Given non-design volume $V_{\text{frozen}} = \sum_{e \in \text{frozen}} V_e$ and design volume $V_{\text{design}} = V_{\text{total}} - V_{\text{frozen}}$, the target physical volume is:
 
@@ -52,11 +52,11 @@ $$\sum_{e=1}^{N_e} (\mathbf{H}^T \mathbf{V})_e \rho_e \le V_{\text{target}}$$
 ### 4. Boundary Extraction & Mesh Fairing
 Let $\mathcal{S} = \{e \mid \tilde{\rho}_e \ge \tau\} \cup \mathcal{S}_{\text{frozen}}$ denote the set of solid tetrahedra. Boundary facets belong to exactly one solid element:
 
-$$\partial \mathcal{S} = \{ f \in \mathcal{F} \mid \operatorname{count}(f) = 1 \}$$
+$$\partial \mathcal{S} = \{ f \in \mathcal{F} \mid \mathrm{count}(f) = 1 \}$$
 
 Singular pinch elements sharing fewer than two triangular faces with solid neighbors are pruned:
 
-$$\mathcal{S}_{\text{pruned}} = \{ e \in \mathcal{S} \setminus \mathcal{S}_{\text{frozen}} \mid \operatorname{deg}_{\mathcal{G}}(e) \ge 2 \}$$
+$$\mathcal{S}_{\text{pruned}} = \{ e \in \mathcal{S} \setminus \mathcal{S}_{\text{frozen}} \mid \deg_{\mathcal{G}}(e) \ge 2 \}$$
 
 The extracted surface mesh is post-processed with Taubin volume-preserving smoothing:
 
