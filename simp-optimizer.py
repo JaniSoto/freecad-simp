@@ -1,9 +1,9 @@
 """
 FreeCAD 3D SIMP Topology Optimization Engine
-Direct in-memory linear elasticity solver and simplicial boundary extraction
-for FreeCAD FEM Workbench meshes.
+In-memory linear elasticity solver and simplicial boundary extraction for FreeCAD FEM Workbench meshes.
 """
 
+import inspect
 import time
 import numpy as np
 import scipy.sparse as sp
@@ -14,27 +14,34 @@ import FreeCADGui as Gui
 import Mesh
 
 CONFIG = {
-    # Target volume fraction (0.35 = 35% of design volume retained)
+    # Retained solid volume fraction of the optimizable design domain (0.35 = 35%)
     "target_volume_fraction": 0.35,
 
     # Minimum strut diameter (mm). Clamped internally to r_min >= 1.5 * h_avg
     "min_member_thickness_mm": 12.0,
 
-    # Iso-density threshold for solid tetrahedral boundary extraction
+    # Iso-density boundary extraction cutoff (tau in [0.45, 0.55])
     "density_cutoff_tau": 0.52,
 
-    # Non-design domain keyword discovery
-    "nondesign_keywords": ["nondesign", "schutzkörper", "preserve", "keep", "frozen"],
+    # Non-design domain identification
+    "nondesign_group": "NonDesign",
+    "nondesign_keywords": ["nondesign", "keep", "preserve", "frozen", "non_design"],
 
-    # Safety collars around boundary condition nodes (0.0 disables)
+    # Safety collars around boundary nodes in mm (0.0 disables; >0 maintains solid anchor seeds)
     "support_collar_radius_mm": 3.0,
     "load_collar_radius_mm": 1.5,
 
-    # Mesh fairing and topological cleanup
-    "taubin_smooth_passes": 18,
-    "anti_pinch_passes": 2,
+    # --- Live Viewport & Performance Controls ---
+    "enable_live_viewport": True,        # Set False to disable live rendering for maximum solve speed
+    "live_update_interval": 1,           # Viewport refresh rate (iterations between redraws)
 
-    # Optimization stopping criteria
+    # --- Mesh Reconstruction & Repair ---
+    "max_micro_hole_edges": 12,          # Max boundary loop edges to heal (0 disables)
+    "min_component_facets": 20,          # Cull detached floating debris smaller than N facets
+    "taubin_smooth_passes": 18,          # Volume-preserving fairing iterations
+    "anti_pinch_passes": 2,              # Topological filter passes to prune singular pinch elements
+
+    # --- Optimization Stopping Criteria ---
     "max_iterations": 60,
     "convergence_tolerance": 0.005,
     "move_limit_initial": 0.20,
@@ -43,10 +50,7 @@ CONFIG = {
 
 
 def build_element_connectivity(elems, num_elems):
-    """
-    Finds face-neighbor tetrahedron pairs (e1, e2).
-    Each linear tet has 4 faces. Matching sorted face node triplets identifies shared boundaries.
-    """
+    """Finds adjacent tetrahedron pairs (e1, e2) sharing a triangular face."""
     all_tet_faces = np.vstack([
         elems[:, [0, 2, 1]],
         elems[:, [0, 1, 3]],
@@ -67,10 +71,7 @@ def build_element_connectivity(elems, num_elems):
 
 
 def filter_anti_pinch(solid_mask, frozen_mask, e1, e2, num_elems, passes):
-    """
-    Prunes isolated elements sharing fewer than 2 faces with solid neighbors.
-    Eliminates 1-element pinch points and edge singularities in thin webs.
-    """
+    """Prunes isolated solid elements sharing fewer than 2 faces with solid neighbors."""
     pruned_mask = solid_mask.copy()
     for _ in range(passes):
         shared_solid = pruned_mask[e1] & pruned_mask[e2]
@@ -86,7 +87,7 @@ def filter_anti_pinch(solid_mask, frozen_mask, e1, e2, num_elems, passes):
 
 
 def extract_boundary_faces(coords, elems, solid_mask):
-    """Extracts boundary triangular facets (facets belonging to exactly one solid tet)."""
+    """Extracts outward-oriented triangular boundary facets from solid tetrahedra."""
     solid_elems = elems[solid_mask]
     if len(solid_elems) == 0:
         return np.empty((0, 3, 3), dtype=np.float64)
@@ -104,7 +105,7 @@ def extract_boundary_faces(coords, elems, solid_mask):
 
 
 def build_live_mesh(coords, elems, rho_phys, frozen_mask, e1, e2, num_elems, tau, passes):
-    """Fast boundary extraction for interactive viewport updates."""
+    """Extracts boundary facets for interactive viewport re-draws."""
     solid_mask = (rho_phys >= tau) | frozen_mask
     solid_mask = filter_anti_pinch(solid_mask, frozen_mask, e1, e2, num_elems, passes)
     triangles = extract_boundary_faces(coords, elems, solid_mask)
@@ -115,8 +116,8 @@ def build_live_mesh(coords, elems, rho_phys, frozen_mask, e1, e2, num_elems, tau
     return m
 
 
-def finalize_watertight_mesh(coords, elems, rho_phys, frozen_mask, e1, e2, num_elems, tau, smooth_passes, pinch_passes):
-    """Final post-processing: boundary extraction, anti-pinch filter, component culling, and Taubin smoothing."""
+def finalize_watertight_mesh(coords, elems, rho_phys, frozen_mask, e1, e2, num_elems, tau, smooth_passes, pinch_passes, max_hole_edges, min_components):
+    """Watertight surface post-processing via simplicial extraction, micro-hole healing, and Taubin smoothing."""
     solid_mask = (rho_phys >= tau) | frozen_mask
     solid_mask = filter_anti_pinch(solid_mask, frozen_mask, e1, e2, num_elems, pinch_passes)
     triangles = extract_boundary_faces(coords, elems, solid_mask)
@@ -124,16 +125,17 @@ def finalize_watertight_mesh(coords, elems, rho_phys, frozen_mask, e1, e2, num_e
         return Mesh.Mesh()
 
     m = Mesh.Mesh(triangles.tolist())
-    m.harmonizeNormals()
-    m.removeComponents(50)
-    m.fillupHoles(500)
-    m.harmonizeNormals()
+
+    if min_components > 0:
+        m.removeComponents(min_components)
+
+    if max_hole_edges > 0:
+        m.fillupHoles(max_hole_edges)
+
     if smooth_passes > 0:
         m.smooth("Taubin", smooth_passes)
-        m.harmonizeNormals()
-    if not m.isSolid():
-        m.fillupHoles(500)
-        m.harmonizeNormals()
+
+    m.harmonizeNormals()
     return m
 
 
@@ -172,10 +174,7 @@ def run_simp():
 
     raw_elem_nodes = [fem_mesh.getElementNodes(eid) for eid in elem_ids]
     if any(len(n) > 4 for n in raw_elem_nodes[:20]):
-        App.Console.PrintError(
-            "SIMP Error: Quadratic elements (TET10) detected. This engine requires linear tetrahedra (TET4).\n"
-            "Please set Gmsh 'Element order' to 1 (linear) in FEM Workbench and re-mesh.\n"
-        )
+        App.Console.PrintError("SIMP Error: Quadratic elements (TET10) detected. Set Gmsh element order to 1 (linear).\n")
         return
 
     elems = np.array([[nid_to_idx[n] for n in en[:4]] for en in raw_elem_nodes], dtype=np.int32)
@@ -204,24 +203,57 @@ def run_simp():
     print(f"[Setup] Mesh: {num_nodes:,} nodes | {num_elems:,} elements | h_avg = {h_avg:.2f} mm ({time.perf_counter()-t0:.2f}s)")
 
     # 3. Dynamic Material Ingestion
+    def is_solid_material(o):
+        if getattr(o, "Category", "Solid") == "Fluid":
+            return False
+        proxy_type = getattr(getattr(o, "Proxy", None), "Type", "")
+        if proxy_type in ("Fem::MaterialSolid", "Fem::MaterialCommon", "MaterialSolid"):
+            return True
+        if o.isDerivedFrom("App::MaterialObjectPython") or o.isDerivedFrom("App::MaterialObject"):
+            return True
+        return hasattr(o, "Material")
+
+    mat_objs = [o for o in analysis.Group if is_solid_material(o)]
+    if not mat_objs:
+        mat_objs = [o for o in doc.Objects if o not in analysis.Group and is_solid_material(o)]
+
     E0, nu = 3000.0, 0.36
-    mat_objs = [o for o in analysis.Group if o.isDerivedFrom("Fem::MaterialSolid")]
     if mat_objs:
-        props = getattr(mat_objs[0], "Material", {})
-        ym = props.get("YoungsModulus", "")
-        pr = props.get("PoissonRatio", "")
+        mat_obj = mat_objs[0]
+        props = getattr(mat_obj, "Material", {})
+        ym, pr = None, None
+        if isinstance(props, dict):
+            ym = props.get("YoungsModulus", "")
+            pr = props.get("PoissonRatio", "")
+        else:
+            ym = getattr(props, "YoungsModulus", getattr(mat_obj, "YoungsModulus", ""))
+            pr = getattr(props, "PoissonRatio", getattr(mat_obj, "PoissonRatio", ""))
+
         try:
             if ym:
-                E0 = App.Units.Quantity(ym).getValueAs("MPa") if isinstance(ym, str) else float(ym)
+                if hasattr(ym, "getValueAs"):
+                    E0 = float(ym.getValueAs("MPa"))
+                elif isinstance(ym, str):
+                    E0 = float(App.Units.Quantity(ym).getValueAs("MPa"))
+                else:
+                    E0 = float(ym)
             if pr:
-                nu = App.Units.Quantity(pr).Value if isinstance(pr, str) else float(pr)
-            print(f"[Setup] Material: '{mat_objs[0].Label}' (E = {E0:.1f} MPa, nu = {nu:.3f})")
+                if hasattr(pr, "Value"):
+                    nu = float(pr.Value)
+                elif isinstance(pr, str):
+                    nu = float(App.Units.Quantity(pr).Value)
+                else:
+                    nu = float(pr)
+            print(f"[Setup] Material: '{mat_obj.Label}' (E = {E0:.1f} MPa, nu = {nu:.3f})")
         except Exception as e:
             print(f"[Setup] Material parse warning: {e}. Defaulting to E = {E0:.1f} MPa, nu = {nu:.3f}")
     else:
         print(f"[Setup] Default Material Assigned: E = {E0:.1f} MPa, nu = {nu:.3f}")
 
+    if nu >= 0.499:
+        nu = 0.49
     Emin = 1e-3 * E0
+
     lam = (E0 * nu) / ((1.0 + nu) * (1.0 - 2.0 * nu))
     mu = E0 / (2.0 * (1.0 + nu))
     C_mat = np.zeros((6, 6), dtype=np.float64)
@@ -258,39 +290,61 @@ def run_simp():
     cols = np.repeat(elem_dofs[:, None, :], 12, axis=1).reshape(-1)
 
     # 5. Boundary Conditions (Supports and Loads)
-    fixed_node_ids = set()
+    fixed_dofs_set = set()
     for o in analysis.Group:
         if o.isDerivedFrom("Fem::ConstraintFixed") or o.isDerivedFrom("Fem::ConstraintDisplacement"):
+            is_disp = o.isDerivedFrom("Fem::ConstraintDisplacement")
+            x_fixed = (not getattr(o, "xFree", False)) and getattr(o, "xFix", True) if is_disp else True
+            y_fixed = (not getattr(o, "yFree", False)) and getattr(o, "yFix", True) if is_disp else True
+            z_fixed = (not getattr(o, "zFree", False)) and getattr(o, "zFix", True) if is_disp else True
+
+            c_node_ids = set()
             for owner, subs in o.References:
                 subs_list = [subs] if isinstance(subs, str) else subs
                 for s in subs_list:
                     elem = owner.Shape.getElement(s)
                     if elem.ShapeType == "Face":
-                        fixed_node_ids.update(fem_mesh.getNodesByFace(elem))
+                        c_node_ids.update(fem_mesh.getNodesByFace(elem))
                     elif elem.ShapeType == "Edge":
-                        fixed_node_ids.update(fem_mesh.getNodesByEdge(elem))
+                        c_node_ids.update(fem_mesh.getNodesByEdge(elem))
                     elif elem.ShapeType == "Vertex":
-                        # Match vertex to nearest mesh node
                         v_coords = np.array([elem.Point.x, elem.Point.y, elem.Point.z])
                         dist = np.linalg.norm(coords - v_coords, axis=1)
-                        fixed_node_ids.add(node_ids[np.argmin(dist)])
+                        if len(dist) > 0:
+                            c_node_ids.add(node_ids[np.argmin(dist)])
 
-    fixed_indices = np.array([nid_to_idx[nid] for nid in fixed_node_ids if nid in nid_to_idx], dtype=np.int32)
-    if fixed_indices.size == 0:
-        App.Console.PrintError("SIMP Error: No fixed support nodes found. Structure must be constrained to prevent rigid body motion.\n")
+            for nid in c_node_ids:
+                if nid in nid_to_idx:
+                    idx = nid_to_idx[nid]
+                    if x_fixed:
+                        fixed_dofs_set.add(3 * idx + 0)
+                    if y_fixed:
+                        fixed_dofs_set.add(3 * idx + 1)
+                    if z_fixed:
+                        fixed_dofs_set.add(3 * idx + 2)
+
+    fixed_dofs = np.array(sorted(fixed_dofs_set), dtype=np.int32)
+    if fixed_dofs.size == 0:
+        App.Console.PrintError("SIMP Error: No fixed support nodes found. Structure must be constrained.\n")
         return
 
-    fixed_dofs = np.concatenate([3 * fixed_indices + 0, 3 * fixed_indices + 1, 3 * fixed_indices + 2])
     free_dofs = np.setdiff1d(np.arange(num_dofs, dtype=np.int32), fixed_dofs)
+    fixed_indices = np.unique(fixed_dofs // 3)
 
     f_global = np.zeros(num_dofs, dtype=np.float64)
     loaded_node_ids = set()
 
     for o in analysis.Group:
         if o.isDerivedFrom("Fem::ConstraintPressure"):
-            p_val = o.Pressure.Value if hasattr(o.Pressure, "Value") else float(o.Pressure)
-            is_rev = getattr(o, "Reversed", False)
-            sign = 1.0 if is_rev else -1.0
+            if isinstance(o.Pressure, str):
+                p_val = float(App.Units.Quantity(o.Pressure).getValueAs("MPa"))
+            elif hasattr(o.Pressure, "getValueAs"):
+                p_val = float(o.Pressure.getValueAs("MPa"))
+            elif hasattr(o.Pressure, "Value"):
+                p_val = float(o.Pressure.Value)
+            else:
+                p_val = float(o.Pressure)
+            sign = 1.0 if getattr(o, "Reversed", False) else -1.0
 
             for owner, subs in o.References:
                 subs_list = [subs] if isinstance(subs, str) else subs
@@ -301,7 +355,6 @@ def run_simp():
                         continue
                     loaded_node_ids.update(p_nodes)
 
-                    # Surface normal evaluated at parameter domain midpoint
                     u0, u1, v0, v1 = face.ParameterRange
                     norm = face.normalAt((u0 + u1) * 0.5, (v0 + v1) * 0.5)
                     norm_vec = np.array([norm.x, norm.y, norm.z], dtype=np.float64)
@@ -316,11 +369,17 @@ def run_simp():
                         f_global[3 * nid : 3 * nid + 3] += f_per_node
 
         elif o.isDerivedFrom("Fem::ConstraintForce"):
-            f_val = o.Force.Value if hasattr(o.Force, "Value") else float(o.Force)
-            is_rev = getattr(o, "Reversed", False)
-            sign = -1.0 if is_rev else 1.0
+            if isinstance(o.Force, str):
+                f_val = float(App.Units.Quantity(o.Force).getValueAs("N"))
+            elif hasattr(o.Force, "getValueAs"):
+                f_val = float(o.Force.getValueAs("N"))
+            elif hasattr(o.Force, "Value"):
+                f_val = float(o.Force.Value) / 1000.0
+            else:
+                f_val = float(o.Force)
+            sign = -1.0 if getattr(o, "Reversed", False) else 1.0
 
-            d_vec = np.array([0.0, 0.0, -1.0], dtype=np.float64)
+            d_vec = None
             if hasattr(o, "DirectionVector"):
                 dv = o.DirectionVector
                 cand = np.array([dv.x, dv.y, dv.z], dtype=np.float64)
@@ -329,12 +388,21 @@ def run_simp():
                     d_vec = cand / mag
 
             constraint_nodes = set()
+            fallback_face_normal = None
+
             for owner, subs in o.References:
                 subs_list = [subs] if isinstance(subs, str) else subs
                 for s in subs_list:
                     elem = owner.Shape.getElement(s)
                     if elem.ShapeType == "Face":
                         constraint_nodes.update(nid_to_idx[nid] for nid in fem_mesh.getNodesByFace(elem) if nid in nid_to_idx)
+                        if fallback_face_normal is None:
+                            u0, u1, v0, v1 = elem.ParameterRange
+                            n = elem.normalAt((u0 + u1) * 0.5, (v0 + v1) * 0.5)
+                            n_vec = np.array([n.x, n.y, n.z], dtype=np.float64)
+                            n_mag = np.linalg.norm(n_vec)
+                            if n_mag > 1e-12:
+                                fallback_face_normal = n_vec / n_mag
                     elif elem.ShapeType == "Edge":
                         constraint_nodes.update(nid_to_idx[nid] for nid in fem_mesh.getNodesByEdge(elem) if nid in nid_to_idx)
                     elif elem.ShapeType == "Vertex":
@@ -343,6 +411,13 @@ def run_simp():
 
             if not constraint_nodes:
                 continue
+
+            if d_vec is None:
+                if fallback_face_normal is not None:
+                    d_vec = fallback_face_normal
+                else:
+                    d_vec = np.array([0.0, 0.0, -1.0], dtype=np.float64)
+                    print(f"[Setup] Note: ConstraintForce '{o.Label}' has no direction vector or face normal. Defaulting to -Z.")
 
             loaded_node_ids.update(constraint_nodes)
             f_per_node = (sign * f_val * d_vec) / len(constraint_nodes)
@@ -357,11 +432,27 @@ def run_simp():
     # 6. Non-Design Keep-In Volumes
     t0_tag = time.perf_counter()
     frozen_elem_set = set()
-    kw = [k.lower() for k in CONFIG["nondesign_keywords"]]
-    nd_candidates = [o for o in doc.Objects if hasattr(o, "Shape") and o.Shape and any(k in o.Label.lower() for k in kw)]
+    nd_candidates = []
+
+    # Method 1: Dedicated FreeCAD Group
+    grp_name = CONFIG.get("nondesign_group", "NonDesign")
+    grp = doc.getObject(grp_name)
+    if grp and hasattr(grp, "Group"):
+        nd_candidates.extend([o for o in grp.Group if hasattr(o, "Shape") and o.Shape])
+
+    # Method 2: Label keyword matching
+    kw = [k.lower() for k in CONFIG.get("nondesign_keywords", [])]
+    if kw:
+        for o in doc.Objects:
+            if hasattr(o, "Shape") and o.Shape and o not in nd_candidates:
+                if any(k in o.Label.lower() for k in kw):
+                    nd_candidates.append(o)
 
     for nd_obj in nd_candidates:
-        solids = nd_obj.Shape.Solids if nd_obj.Shape.Solids else [nd_obj.Shape]
+        shape = nd_obj.Shape.copy()
+        if hasattr(nd_obj, "getGlobalPlacement"):
+            shape.Placement = nd_obj.getGlobalPlacement()
+        solids = shape.Solids if shape.Solids else [shape]
         for solid in solids:
             bb = solid.BoundBox
             in_bb = (
@@ -383,7 +474,9 @@ def run_simp():
 
     frozen_mask = np.zeros(num_elems, dtype=bool)
     frozen_mask[list(frozen_elem_set)] = True
-    print(f"[Setup] Frozen Non-Design: {np.sum(frozen_mask):,} / {num_elems:,} elements ({np.sum(frozen_mask)/num_elems*100:.1f}%) in {time.perf_counter()-t0_tag:.2f}s")
+    V_frozen = float(np.sum(V_e[frozen_mask]))
+    V_design = V_total - V_frozen
+    print(f"[Setup] Frozen Non-Design: {np.sum(frozen_mask):,} / {num_elems:,} elements ({V_frozen/V_total*100:.1f}% volume) in {time.perf_counter()-t0_tag:.2f}s")
 
     # 7. Mesh-Clamped Adjoint Filter Matrix
     t0 = time.perf_counter()
@@ -409,15 +502,18 @@ def run_simp():
     # 8. Viewport Object Initialization
     live_obj = doc.getObject("SIMP_Final_Printable_Mesh") or doc.addObject("Mesh::Feature", "SIMP_Final_Printable_Mesh")
     live_obj.Label = "SIMP_Final_Printable_Mesh"
-    if App.GuiUp:
+    if getattr(App, "GuiUp", False):
         live_obj.ViewObject.ShapeColor = (0.2, 0.7, 0.9)
         live_obj.ViewObject.DisplayMode = "Shaded"
 
     # 9. Optimization Loop
     Vf_target = CONFIG["target_volume_fraction"]
+    V_target_total = V_frozen + Vf_target * V_design
     max_iters = CONFIG["max_iterations"]
     tol = CONFIG["convergence_tolerance"]
     move = CONFIG["move_limit_initial"]
+    live_interval = max(1, int(CONFIG.get("live_update_interval", 1)))
+    enable_live = bool(CONFIG.get("enable_live_viewport", True)) and bool(getattr(App, "GuiUp", False))
 
     rho = np.full(num_elems, Vf_target, dtype=np.float64)
     rho[frozen_mask] = 1.0
@@ -426,9 +522,13 @@ def run_simp():
     u_free = np.zeros(len(free_dofs), dtype=np.float64)
     u_global = np.zeros(num_dofs, dtype=np.float64)
 
-    live_obj.Mesh = build_live_mesh(coords, elems, rho_phys, frozen_mask, e1_adj, e2_adj, num_elems, CONFIG["density_cutoff_tau"], CONFIG["anti_pinch_passes"])
-    if App.GuiUp:
-        Gui.updateGui()
+    cg_kwargs = {"rtol": CONFIG["pcg_tolerance"]} if "rtol" in inspect.signature(spla.cg).parameters else {"tol": CONFIG["pcg_tolerance"]}
+
+    if enable_live:
+        live_obj.Mesh = build_live_mesh(coords, elems, rho_phys, frozen_mask, e1_adj, e2_adj, num_elems, CONFIG["density_cutoff_tau"], CONFIG["anti_pinch_passes"])
+        doc.recompute()
+        if App.GuiUp:
+            Gui.updateGui()
 
     print("\n--- Starting Optimization Loop ---")
     print("Iter | Penal (p) | Compliance (N*mm) | Vol Frac | Delta Rho | PCG Iters | Move | Time")
@@ -456,7 +556,9 @@ def run_simp():
             nonlocal pcg_count
             pcg_count += 1
 
-        u_free, _ = spla.cg(K_free, f_free, x0=u_free, M=M_prec, rtol=CONFIG["pcg_tolerance"], maxiter=2500, callback=cg_monitor)
+        u_free, info = spla.cg(K_free, f_free, x0=u_free, M=M_prec, maxiter=2500, callback=cg_monitor, **cg_kwargs)
+        if info > 0:
+            App.Console.PrintWarning(f"SIMP Warning: PCG did not reach tolerance at iteration {it} (code: {info}).\n")
         u_global[free_dofs] = u_free
 
         u_e = u_global[elem_dofs]
@@ -464,7 +566,7 @@ def run_simp():
         ce_base = np.einsum('ei,ei->e', u_e, k0_u)
         compliance = float(np.sum((Emin + (rho_phys ** p) * (E0 - Emin)) / E0 * ce_base))
 
-        dC_drho_phys = -p * (rho_phys ** (p - 1)) * (1.0 - Emin / E0) * (ce_base / E0)
+        dC_drho_phys = -p * (rho_phys ** (p - 1)) * (1.0 - Emin / E0) * ce_base
         dC_drho = H_filter.T.dot(dC_drho_phys)
 
         l1, l2 = 1e-12, 1e12
@@ -475,13 +577,11 @@ def run_simp():
             l_mid = 0.5 * (l1 + l2)
             Be = -dC_drho / (l_mid * dV_drho)
 
-            # Two-stage clip: move limits followed by absolute bounds [1e-3, 1.0]
             rho_cand = rho * np.sqrt(np.maximum(1e-12, Be))
             rho_new = np.clip(np.clip(rho_cand, rho - move, rho + move), 1e-3, 1.0)
             rho_new[frozen_mask] = 1.0
 
-            # Enforces physical volume via adjoint gradient: V_phys = sum(rho_new * dV_drho)
-            if (np.sum(rho_new * dV_drho) / V_total) > Vf_target:
+            if np.sum(rho_new * dV_drho) > V_target_total:
                 l1 = l_mid
             else:
                 l2 = l_mid
@@ -490,10 +590,12 @@ def run_simp():
         rho_phys = H_filter.dot(rho)
 
         delta_rho = float(np.max(np.abs(rho - rho_old)))
-        curr_vf = float(np.sum(rho_phys * V_e) / V_total)
+        curr_vf = float((np.sum(rho_phys * V_e) - V_frozen) / V_design) if V_design > 0 else float(np.sum(rho_phys * V_e) / V_total)
 
-        if it % 2 == 0 or it == max_iters:
+        # Interactive live viewport update (bypassed if enable_live_viewport is False or headless)
+        if enable_live and (it % live_interval == 0 or it == max_iters):
             live_obj.Mesh = build_live_mesh(coords, elems, rho_phys, frozen_mask, e1_adj, e2_adj, num_elems, CONFIG["density_cutoff_tau"], CONFIG["anti_pinch_passes"])
+            doc.recompute()
             if App.GuiUp:
                 Gui.updateGui()
 
@@ -506,13 +608,15 @@ def run_simp():
 
     # 10. Final Solid Solidification & Mesh Repair
     print("\n[Post-Process] Finalizing watertight solid...")
+    min_comps = CONFIG.get("min_component_facets", CONFIG.get("remove_components_min_facets", 20))
     final_mesh = finalize_watertight_mesh(
         coords, elems, rho_phys, frozen_mask, e1_adj, e2_adj, num_elems,
-        CONFIG["density_cutoff_tau"], CONFIG["taubin_smooth_passes"], CONFIG["anti_pinch_passes"]
+        CONFIG["density_cutoff_tau"], CONFIG["taubin_smooth_passes"], CONFIG["anti_pinch_passes"],
+        CONFIG["max_micro_hole_edges"], min_comps
     )
     live_obj.Mesh = final_mesh
     doc.recompute()
-    if App.GuiUp:
+    if getattr(App, "GuiUp", False):
         Gui.updateGui()
 
     comps = final_mesh.getSeparateComponents()
@@ -523,3 +627,4 @@ def run_simp():
 
 if __name__ == "__main__":
     run_simp()
+
