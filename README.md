@@ -2,6 +2,9 @@
 
 An in-memory 3D Solid Isotropic Material with Penalization (SIMP) topology optimization macro for FreeCAD. Directly couples with FreeCAD's native FEM Workbench data structures, avoiding external solver disk I/O, and reconstructs solid geometry via simplicial boundary extraction.
 
+> [!NOTE]
+> **Academic Context & Disclaimer:** This project was developed as an educational prototype for a university presentation on SIMP topology optimization. The theoretical background research, architecture, and implementation were iteratively developed and prototyped with the assistance of Gemini 3.8 Flash (Google DeepMind). This engine is intended for demonstrative and educational purposes and has not undergone empirical structural validation or safety certification for physical load-bearing applications.
+
 ---
 
 ## Technical Highlights
